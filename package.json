@@ -5,6 +5,9 @@
   "scripts": {
     "start": "node server.js"
   },
+  "engines": {
+    "node": "20.x"
+  },
   "dependencies": {
     "@google/genai": "latest",
     "express": "^4.19.2",
