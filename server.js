@@ -16,7 +16,17 @@ app.get('/', (req, res) => {
     res.sendFile(path.join(__dirname, 'index.html'));
 });
 
-// Rota que processa a pesquisa no Drive e envia para o Gemini
+// Função auxiliar para chamar o Gemini com Plano B automático se o servidor principal falhar (Erro 503)
+async function chamarGeminiComFallback(ai, params) {
+    try {
+        return await ai.models.generateContent({ model: 'gemini-2.5-flash', ...params });
+    } catch (erro) {
+        console.warn("⚠️ Modelo principal (2.5-flash) indisponível. Acionando backup (1.5-flash)...");
+        return await ai.models.generateContent({ model: 'gemini-1.5-flash', ...params });
+    }
+}
+
+// Rota que processa a pesquisa profunda dentro dos PDFs do Drive
 app.post('/api/gemini-workspace', async (req, res) => {
     try {
         const { pergunta } = req.body;
@@ -25,19 +35,16 @@ app.post('/api/gemini-workspace', async (req, res) => {
             return res.status(400).json({ resultado: "A pergunta não foi fornecida." });
         }
 
-        // 1. Captura das Variáveis de Ambiente do Render
         const credenciaisGoogle = process.env.GOOGLE_CREDENTIALS;
         const pastaId = process.env.GOOGLE_DRIVE_FOLDER_ID;
         const chaveGemini = process.env.GEMINI_API_KEY;
 
         if (!credenciaisGoogle || !pastaId || !chaveGemini) {
-            console.error("❌ ERRO: Variáveis de ambiente ausentes no painel do Render.");
-            return res.status(500).json({ 
-                resultado: "Erro de Configuração: Chaves ausentes no painel do Render." 
-            });
+            console.error("❌ ERRO: Variáveis de ambiente ausentes no Render.");
+            return res.status(500).json({ resultado: "Erro de Configuração: Chaves ausentes no painel do Render." });
         }
 
-        // 2. Autenticação com GoogleAuth
+        // 1. Autenticação com o Google Drive
         let auth;
         try {
             auth = new google.auth.GoogleAuth({
@@ -51,7 +58,7 @@ app.post('/api/gemini-workspace', async (req, res) => {
 
         const drive = google.drive({ version: 'v3', auth });
 
-        // 3. Listagem de arquivos da pasta do Google Drive
+        // 2. Lista os arquivos disponíveis na pasta
         let listaDrive;
         try {
             listaDrive = await drive.files.list({
@@ -60,9 +67,7 @@ app.post('/api/gemini-workspace', async (req, res) => {
             });
         } catch (erroDrive) {
             console.error("❌ ERRO NO GOOGLE DRIVE API:", erroDrive.message);
-            return res.status(500).json({ 
-                resultado: `O Google Drive recusou o acesso. Detalhes: ${erroDrive.message}` 
-            });
+            return res.status(500).json({ resultado: `O Google Drive recusou a listagem: ${erroDrive.message}` });
         }
 
         const ficheiros = listaDrive.data.files;
@@ -70,77 +75,109 @@ app.post('/api/gemini-workspace', async (req, res) => {
             return res.json({ resultado: "Nenhum arquivo PDF foi localizado dentro da pasta configurada no Google Drive." });
         }
 
-        // 4. Inicialização da API do Gemini
+        // 3. Inicializa a API do Gemini
         const ai = new GoogleGenAI({ apiKey: chaveGemini });
 
-        const promptSistema = `Você é um assistente inteligente integrado ao Google Drive de uma corretora de seguros. 
-        Analise a pergunta do usuário e a lista de arquivos PDFs disponíveis abaixo para encontrar a resposta correta.
+        // ETAPA 1: Triagem Inteligente (Descobrir qual arquivo abrir baseado na pergunta)
+        const promptSelecao = `Analise a pergunta do usuário e determine qual dos arquivos abaixo é o correto para ler e responder à dúvida.
         
-        Arquivos disponíveis na pasta do Drive: ${JSON.stringify(ficheiros.map(f => ({ nome: f.name, id: f.id })))}
+        Arquivos disponíveis: ${JSON.stringify(ficheiros.map(f => ({ id: f.id, nome: f.name })))}
+        Pergunta do usuário: "${pergunta}"
         
-        Responda à dúvida do usuário de forma clara e profissional. 
-        OBRIGATORIAMENTE, no final da sua resposta, inclua o ID do arquivo correto no formato [ID:identificador_do_arquivo] e a página estimada no formato [PAGINA:numero_da_pagina].
-        
-        Pergunta do usuário: ${pergunta}`;
+        Responda APENAS E EXCLUSIVAMENTE com o ID do arquivo correspondente (ex: 1A2B3C4D). Se for uma pergunta geral ou nenhum arquivo servir, responda apenas: NONE`;
 
-        // 5. Execução inteligente do Gemini com Fallback (Plano B) se houver erro 503
-        let response;
+        let respostaSelecao;
         try {
-            console.log("Tentando modelo principal (gemini-2.5-flash)...");
-            response = await ai.models.generateContent({
-                model: 'gemini-2.5-flash',
-                contents: promptSistema
-            });
-        } catch (erroGemini) {
-            // Se o erro for de indisponibilidade (503) ou alta demanda, aciona o Plano B
-            console.warn("⚠️ Modelo principal ocupado. Acionando modelo de backup (gemini-1.5-flash)...");
-            try {
-                response = await ai.models.generateContent({
-                    model: 'gemini-1.5-flash',
-                    contents: promptSistema
-                });
-            } catch (erroBackup) {
-                console.error("❌ AMBOS OS MODELOS FALHARAM:", erroBackup.message);
-                return res.status(503).json({ 
-                    resultado: "Os servidores da inteligência artificial da Google estão sobrecarregados agora. Por favor, aguarde um minutinho e tente enviar sua mensagem novamente." 
-                });
-            }
+            respostaSelecao = await chamarGeminiComFallback(ai, { contents: promptSelecao });
+        } catch (e) {
+            console.error("❌ Falha na etapa de triagem do Gemini:", e.message);
+            return res.status(503).json({ resultado: "Os servidores do Gemini estão instáveis. Tente novamente em alguns segundos." });
         }
 
-        const textoResposta = response.text;
+        const textoSelecao = respostaSelecao.text || "";
+        
+        // Localiza qual dos nossos arquivos bate com a seleção do Gemini (seguro contra textos extras)
+        const arquivoAlvo = ficheiros.find(f => textoSelecao.includes(f.id));
 
-        // 6. Extração de Metadados para o iframe lateral
-        const matchId = textoResposta.match(/\[ID:(.*?)\]/);
+        // Se nenhum arquivo específico foi selecionado pelo Gemini
+        if (!arquivoAlvo) {
+            return res.json({
+                resultado: "Não consegui identificar uma apólice ou cliente específico para essa pergunta. Por favor, digite o nome do cliente de forma clara.",
+                pdfUrl: null,
+                pagina: 1
+            });
+        }
+
+        console.log(`📂 Arquivo identificado para leitura profunda: ${arquivoAlvo.name}`);
+
+        // ETAPA 2: Download do binário do PDF do Google Drive
+        let pdfBuffer;
+        try {
+            const download = await drive.files.get(
+                { fileId: arquivoAlvo.id, alt: 'media' },
+                { responseType: 'arraybuffer' }
+            );
+            pdfBuffer = Buffer.from(download.data);
+        } catch (erroDownload) {
+            console.error(`❌ Erro ao baixar o PDF ${arquivoAlvo.name}:`, erroDownload.message);
+            return res.status(500).json({ resultado: `Não consegui ler o arquivo do Drive. Verifique se ele está corrompido.` });
+        }
+
+        // ETAPA 3: Leitura Multimodal Profunda (O Gemini lê o PDF de verdade)
+        const promptFinal = `Você é um assistente integrado ao sistema de uma corretora de seguros.
+        Analise cuidadosamente o documento PDF anexo ("${arquivoAlvo.name}") para responder à dúvida do usuário.
+        
+        Pergunta do usuário: "${pergunta}"
+        
+        Diretrizes da resposta:
+        1. Seja altamente preciso, detalhado e profissional com base nos dados do PDF.
+        2. OBRIGATORIAMENTE, no final do seu texto, informe em qual página do documento você encontrou essa resposta usando exatamente o padrão [PAGINA:numero]. Exemplo: "... Conforme a cláusula x, o prêmio é de R$ 500. [PAGINA:3]"
+        3. Se a informação solicitada não existir dentro deste PDF, diga de forma honesta que não localizou o dado no documento.`;
+
+        let respostaFinal;
+        try {
+            respostaFinal = await chamarGeminiComFallback(ai, {
+                contents: [
+                    {
+                        inlineData: {
+                            data: pdfBuffer.toString("base64"),
+                            mimeType: "application/pdf"
+                        }
+                    },
+                    promptFinal
+                ]
+            });
+        } catch (erroGeminiFinal) {
+            console.error("❌ Erro na leitura profunda do Gemini:", erroGeminiFinal.message);
+            return res.status(503).json({ resultado: "Erro ao processar o conteúdo do PDF com a inteligência artificial. Tente novamente." });
+        }
+
+        const textoResposta = respostaFinal.text || "";
+
+        // 4. Extração da página para sincronizar o iframe lateral
         const matchPagina = textoResposta.match(/\[PAGINA:(\d+)\]/);
-
-        let idEncontrado = null;
         let paginaEncontrada = 1;
-        let pdfUrl = null;
-
-        if (matchId) idEncontrado = matchId[1].trim();
         if (matchPagina) paginaEncontrada = parseInt(matchPagina[1]);
 
-        if (idEncontrado) {
-            const fCorrespondente = ficheiros.find(f => f.id === idEncontrado);
-            if (fCorrespondente && fCorrespondente.webViewLink) {
-                pdfUrl = fCorrespondente.webViewLink.replace('/view', '/preview');
-            }
-        }
+        // Limpa a tag técnica antes de exibir o texto no chat
+        const respostaLimpa = textoResposta.replace(/\[PAGINA:\d+\]/g, '').trim();
 
-        const respostaLimpa = textoResposta.replace(/\[ID:.*?\]|\[PAGINA:\d+\]/g, '').trim();
+        // Altera a URL para o modo preview (compatível com iframes)
+        const pdfUrlOriginal = arquivoAlvo.webViewLink || "";
+        const pdfUrlPreview = pdfUrlOriginal.replace('/view', '/preview');
 
         return res.json({
             resultado: respostaLimpa,
-            pdfUrl: pdfUrl,
+            pdfUrl: pdfUrlPreview,
             pagina: paginaEncontrada
         });
 
     } catch (erroGeral) {
         console.error("❌ ERRO CRÍTICO NO SERVIDOR:", erroGeral);
-        return res.status(500).json({ resultado: `Erro inesperado interno no servidor: ${erroGeral.message}` });
+        return res.status(500).json({ resultado: `Erro crítico interno: ${erroGeral.message}` });
     }
 });
 
 app.listen(PORT, () => {
-    console.log(`🚀 Servidor rodando com sucesso na porta ${PORT}`);
+    console.log(`🚀 Servidor Workspace rodando com sucesso na porta ${PORT}`);
 });
