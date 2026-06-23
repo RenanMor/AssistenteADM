@@ -6,13 +6,12 @@ const path = require('path');
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// Configuração para processar JSON
 app.use(express.json({ limit: '50mb' }));
 
-// Serve todos os arquivos estáticos diretamente da raiz do projeto
+// Serve os arquivos estáticos diretamente da raiz do projeto
 app.use(express.static(__dirname));
 
-// Rota principal que abre o chat automaticamente
+// Rota principal para abrir o index.html automaticamente
 app.get('/', (req, res) => {
     res.sendFile(path.join(__dirname, 'index.html'));
 });
@@ -23,37 +22,36 @@ app.post('/api/gemini-workspace', async (req, res) => {
         const { pergunta } = req.body;
 
         if (!pergunta) {
-            return res.status(400).json({ resultado: "A pergunta não foi fornecida pelo usuário." });
+            return res.status(400).json({ resultado: "A pergunta não foi fornecida." });
         }
 
-        // 1. Captura e validação rigorosa das Variáveis de Ambiente do Render
-        const emailRobo = process.env.GOOGLE_SERVICE_ACCOUNT_EMAIL;
-        let chavePrivada = process.env.GOOGLE_SERVICE_ACCOUNT_KEY;
+        // 1. Captura das Variáveis de Ambiente do Render
+        const credenciaisGoogle = process.env.GOOGLE_CREDENTIALS;
         const pastaId = process.env.GOOGLE_DRIVE_FOLDER_ID;
         const chaveGemini = process.env.GEMINI_API_KEY;
 
-        // Se alguma variável estiver faltando no Render, avisa diretamente no console e na tela do chat
-        if (!emailRobo || !chavePrivada || !pastaId || !chaveGemini) {
-            console.error("❌ ERRO CRÍTICO: Variáveis de ambiente ausentes no painel do Render.");
+        if (!credenciaisGoogle || !pastaId || !chaveGemini) {
+            console.error("❌ ERRO: Variáveis de ambiente ausentes no painel do Render.");
             return res.status(500).json({ 
-                resultado: `Erro de Configuração: Verifique o painel do Render. Status das chaves -> E-mail: ${!!emailRobo}, Chave Privada: ${!!chavePrivada}, ID Pasta: ${!!pastaId}, Chave Gemini: ${!!chaveGemini}` 
+                resultado: `Erro de Configuração: Chaves ausentes no Render. Google Credentials: ${!!credenciaisGoogle}, ID Pasta: ${!!pastaId}, Chave Gemini: ${!!chaveGemini}` 
             });
         }
 
-        // 2. Limpeza da Chave Privada (Remove aspas acidentais e corrige quebras de linha)
-        chavePrivada = chavePrivada.replace(/^["']|["']$/g, '').replace(/\\n/g, '\n');
-
-        // 3. Autenticação oficial no Google Drive via JWT (Conta de Serviço)
-        const auth = new google.auth.JWT(
-            emailRobo,
-            null,
-            chavePrivada,
-            ['https://www.googleapis.com/auth/drive.readonly']
-        );
+        // 2. Autenticação robusta com GoogleAuth (Lê o arquivo JSON completo automaticamente)
+        let auth;
+        try {
+            auth = new google.auth.GoogleAuth({
+                credentials: JSON.parse(credenciaisGoogle),
+                scopes: ['https://www.googleapis.com/auth/drive.readonly']
+            });
+        } catch (erroJson) {
+            console.error("❌ ERRO NO PARSE DO JSON (GOOGLE_CREDENTIALS):", erroJson.message);
+            return res.status(500).json({ resultado: "Erro no Servidor: A variável GOOGLE_CREDENTIALS não contém um JSON válido. Copie todo o conteúdo do arquivo .json." });
+        }
 
         const drive = google.drive({ version: 'v3', auth });
 
-        // 4. Listagem segura de arquivos da pasta do Google Drive
+        // 3. Listagem de arquivos da pasta do Google Drive
         let listaDrive;
         try {
             listaDrive = await drive.files.list({
@@ -63,7 +61,7 @@ app.post('/api/gemini-workspace', async (req, res) => {
         } catch (erroDrive) {
             console.error("❌ ERRO NO GOOGLE DRIVE API:", erroDrive.message);
             return res.status(500).json({ 
-                resultado: `O Google Drive recusou o acesso. Detalhes: ${erroDrive.message}. Certifique-se de que removeu as aspas ao colar a chave privada no Render e que compartilhou a pasta com o e-mail do robô.` 
+                resultado: `O Google Drive recusou o acesso. Detalhes: ${erroDrive.message}` 
             });
         }
 
@@ -72,7 +70,7 @@ app.post('/api/gemini-workspace', async (req, res) => {
             return res.json({ resultado: "Nenhum arquivo PDF foi localizado dentro da pasta configurada no Google Drive." });
         }
 
-        // 5. Inicialização da inteligência do Gemini AI
+        // 4. Inicialização da API do Gemini
         const ai = new GoogleGenAI({ apiKey: chaveGemini });
 
         const promptSistema = `Você é um assistente inteligente integrado ao Google Drive de uma corretora de seguros. 
@@ -99,7 +97,7 @@ app.post('/api/gemini-workspace', async (req, res) => {
 
         const textoResposta = response.text;
 
-        // 6. Extração de Metadados ([ID:...] e [PAGINA:...]) para carregar o PDF lateralmente
+        // 5. Extração de Metadados para o iframe lateral
         const matchId = textoResposta.match(/\[ID:(.*?)\]/);
         const matchPagina = textoResposta.match(/\[PAGINA:(\d+)\]/);
 
@@ -113,15 +111,13 @@ app.post('/api/gemini-workspace', async (req, res) => {
         if (idEncontrado) {
             const fCorrespondente = ficheiros.find(f => f.id === idEncontrado);
             if (fCorrespondente && fCorrespondente.webViewLink) {
-                // Altera o link padrão de visualização para o modo de embutir em iframe (/preview)
                 pdfUrl = fCorrespondente.webViewLink.replace('/view', '/preview');
             }
         }
 
-        // Limpa as tags técnicas da resposta para que o usuário final veja apenas o texto puro
+        // Limpa as tags do texto enviado ao chat
         const respostaLimpa = textoResposta.replace(/\[ID:.*?\]|\[PAGINA:\d+\]/g, '').trim();
 
-        // Retorna a resposta limpa e os metadados do PDF para o index.html
         return res.json({
             resultado: respostaLimpa,
             pdfUrl: pdfUrl,
@@ -129,12 +125,11 @@ app.post('/api/gemini-workspace', async (req, res) => {
         });
 
     } catch (erroGeral) {
-        console.error("❌ ERRO GERAL NO SERVIDOR:", erroGeral);
+        console.error("❌ ERRO CRÍTICO NO SERVIDOR:", erroGeral);
         return res.status(500).json({ resultado: `Erro inesperado interno no servidor: ${erroGeral.message}` });
     }
 });
 
-// Inicialização oficial do Servidor Express
 app.listen(PORT, () => {
-    console.log(`🚀 Servidor rodando com sucesso no Render na porta ${PORT}`);
+    console.log(`🚀 Servidor rodando com sucesso na porta ${PORT}`);
 });
