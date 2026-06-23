@@ -51,8 +51,15 @@ app.post('/api/gemini-workspace', async (req, res) => {
             return res.json({ resultado: "Nenhum arquivo PDF foi encontrado na pasta do Drive configurada. Verifique as permissões do robô." });
         }
 
-        // 3. Inicialização e chamada da API do Gemini
-        const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
+        // 3. Inicialização e chamada da API do Gemini (CORRIGIDO)
+        const minhaChaveGemini = process.env.GEMINI_API_KEY;
+        
+        if (!minhaChaveGemini) {
+            console.error("ERRO: A variável GEMINI_API_KEY não foi encontrada no Render.");
+            return res.json({ resultado: "Erro de configuração: Chave do Gemini não encontrada no servidor." });
+        }
+
+        const ai = new GoogleGenAI({ apiKey: minhaChaveGemini });
 
         const promptSistema = `Você é um assistente inteligente integrado ao Google Drive de uma corretora de seguros. 
         Analise a pergunta do usuário e a lista de arquivos PDFs disponíveis abaixo para encontrar a resposta correta.
