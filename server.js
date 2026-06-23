@@ -33,11 +33,11 @@ app.post('/api/gemini-workspace', async (req, res) => {
         if (!credenciaisGoogle || !pastaId || !chaveGemini) {
             console.error("❌ ERRO: Variáveis de ambiente ausentes no painel do Render.");
             return res.status(500).json({ 
-                resultado: `Erro de Configuração: Chaves ausentes no Render. Google Credentials: ${!!credenciaisGoogle}, ID Pasta: ${!!pastaId}, Chave Gemini: ${!!chaveGemini}` 
+                resultado: "Erro de Configuração: Chaves ausentes no painel do Render." 
             });
         }
 
-        // 2. Autenticação robusta com GoogleAuth (Lê o arquivo JSON completo automaticamente)
+        // 2. Autenticação com GoogleAuth
         let auth;
         try {
             auth = new google.auth.GoogleAuth({
@@ -45,8 +45,8 @@ app.post('/api/gemini-workspace', async (req, res) => {
                 scopes: ['https://www.googleapis.com/auth/drive.readonly']
             });
         } catch (erroJson) {
-            console.error("❌ ERRO NO PARSE DO JSON (GOOGLE_CREDENTIALS):", erroJson.message);
-            return res.status(500).json({ resultado: "Erro no Servidor: A variável GOOGLE_CREDENTIALS não contém um JSON válido. Copie todo o conteúdo do arquivo .json." });
+            console.error("❌ ERRO NO PARSE DO JSON:", erroJson.message);
+            return res.status(500).json({ resultado: "Erro no Servidor: Estrutura da credencial do Google inválida." });
         }
 
         const drive = google.drive({ version: 'v3', auth });
@@ -80,24 +80,36 @@ app.post('/api/gemini-workspace', async (req, res) => {
         
         Responda à dúvida do usuário de forma clara e profissional. 
         OBRIGATORIAMENTE, no final da sua resposta, inclua o ID do arquivo correto no formato [ID:identificador_do_arquivo] e a página estimada no formato [PAGINA:numero_da_pagina].
-        Exemplo de final de resposta: "... O valor total é R$ 1.500. [ID:1A2B3C4D] [PAGINA:3]"
         
         Pergunta do usuário: ${pergunta}`;
 
+        // 5. Execução inteligente do Gemini com Fallback (Plano B) se houver erro 503
         let response;
         try {
+            console.log("Tentando modelo principal (gemini-2.5-flash)...");
             response = await ai.models.generateContent({
                 model: 'gemini-2.5-flash',
                 contents: promptSistema
             });
         } catch (erroGemini) {
-            console.error("❌ ERRO NA API DO GEMINI:", erroGemini.message);
-            return res.status(500).json({ resultado: `Falha na API do Gemini: ${erroGemini.message}` });
+            // Se o erro for de indisponibilidade (503) ou alta demanda, aciona o Plano B
+            console.warn("⚠️ Modelo principal ocupado. Acionando modelo de backup (gemini-1.5-flash)...");
+            try {
+                response = await ai.models.generateContent({
+                    model: 'gemini-1.5-flash',
+                    contents: promptSistema
+                });
+            } catch (erroBackup) {
+                console.error("❌ AMBOS OS MODELOS FALHARAM:", erroBackup.message);
+                return res.status(503).json({ 
+                    resultado: "Os servidores da inteligência artificial da Google estão sobrecarregados agora. Por favor, aguarde um minutinho e tente enviar sua mensagem novamente." 
+                });
+            }
         }
 
         const textoResposta = response.text;
 
-        // 5. Extração de Metadados para o iframe lateral
+        // 6. Extração de Metadados para o iframe lateral
         const matchId = textoResposta.match(/\[ID:(.*?)\]/);
         const matchPagina = textoResposta.match(/\[PAGINA:(\d+)\]/);
 
@@ -115,7 +127,6 @@ app.post('/api/gemini-workspace', async (req, res) => {
             }
         }
 
-        // Limpa as tags do texto enviado ao chat
         const respostaLimpa = textoResposta.replace(/\[ID:.*?\]|\[PAGINA:\d+\]/g, '').trim();
 
         return res.json({
